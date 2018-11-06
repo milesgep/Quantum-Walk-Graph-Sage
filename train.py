@@ -64,6 +64,9 @@ def parse_args():
     parser.add_argument('--log-interval', default=10, type=int)
     parser.add_argument('--seed', default=123, type=int)
     parser.add_argument('--show-test', action="store_true")
+
+    # Use quantum walk
+    parser.add_argument("--quantum-walk", type=bool, default=False)
     
     # --
     # Validate args
@@ -120,6 +123,7 @@ if __name__ == "__main__":
         "lr_init" : args.lr_init,
         "lr_schedule" : args.lr_schedule,
         "weight_decay" : args.weight_decay,
+        "quantum_walk" : args.quantum_walk,
     })
     
     if args.cuda:
@@ -146,7 +150,6 @@ if __name__ == "__main__":
                 targets=targets,
                 loss_fn=problem.loss_fn,
             )
-            
             train_metric = problem.metric_fn(to_numpy(targets), to_numpy(preds))
             print(json.dumps({
                 "epoch" : epoch,

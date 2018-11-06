@@ -46,7 +46,10 @@ class UniformNeighborSampler(object):
             perm = perm.cuda()
         
         tmp = tmp[:,perm]
-        return tmp[:,:n_samples]
+        tmp = tmp[:,:n_samples]
+
+        return tmp
+
 
 
 class SparseUniformNeighborSampler(object):
@@ -200,7 +203,6 @@ class MeanAggregator(nn.Module, AggregatorMixin):
         out = self.combine_fn([self.fc_x(x), self.fc_neib(agg_neib)])
         if self.activation:
             out = self.activation(out)
-        
         return out
 
 
@@ -328,3 +330,107 @@ aggregator_lookup = {
     "lstm" : LSTMAggregator,
     "attention" : AttentionAggregator,
 }
+
+class QuantumWalk(nn.Module):
+    def __init__(self):
+        super(QuantumWalk, self).__init__()
+        self.coins = nn.ParameterList()
+    
+    def forward(self, x, neibs, init_amps, graphs, time_steps, degree):
+
+        amps = init_amps
+
+        # Need to make coins for two different sized matrices
+        if len(self.coins) == 0:
+            for t in range(time_steps):
+                self.coins.append(nn.Parameter(torch.FloatTensor(
+                    groverDiffusion(degree))))
+        elif len(self.coins) == time_steps:
+            for t in range(time_steps):
+                self.coins.append(nn.Parameter(torch.FloatTensor(
+                    groverDiffusion(degree))))
+
+        for t in range(time_steps):
+            # Coin Operator
+            # Need to make sure we are matmul with the right coin
+            if len(self.coins[0]) == degree:
+                a=torch.matmul(amps.permute(0,1,3,2), self.coins[t]).permute(0,1,3,2)
+            else:
+                a=torch.matmul(amps.permute(0,1,3,2), self.coins[t+time_steps]).permute(0,1,3,2)
+
+            #Swap Operator: The loop is a workaround to allow for permuting elements without destroying the gradient
+            app = []
+            for i in range(amps.size()[0]):
+                ai=a[i]
+
+                # Moving the creation of the swap operator here to decrease the size of memory needed, will slow computation down though - trade off
+                swap_a, swap_b = [], []
+                inds=np.zeros(graphs.shape[1])
+                for j in range(graphs.shape[1]):
+                    neighbors=np.argwhere(graphs[i][j].numpy()==1).flatten()
+                    for n in range(degree):
+                        if n < len(neighbors):
+                            swap_a.append(neighbors[n])
+                            swap_b.append(int(inds[neighbors[n]]))
+                            inds[neighbors[n]]+=1
+                        else:
+                            swap_a.append(j)
+                            swap_b.append(n)
+                swap_a = torch.LongTensor(swap_a)
+                swap_b = torch.LongTensor(swap_b)
+                #if x.is_cuda:
+                #    swap_a, swap_b = swap_a.cuda(), swap_b.cuda()
+
+                app.append(ai[swap_a, swap_b].view((1,)+init_amps.size()[1:]))
+            amps=torch.cat(app,0)
+        d = torch.sum(amps*amps,dim=2)
+        quant_neibs = torch.matmul(torch.transpose(d,1,2),neibs.view(torch.transpose(d,1,2).shape[0], -1, x.shape[1]))
+
+        #quant_neibs = z.view(x.shape[0], -1, x.shape[1]) # Careful
+
+        return quant_neibs.view(-1, quant_neibs.shape[2])
+
+def GenerateQuantumWalkGraphs(adj, tmp, batch_size, graph_size):
+
+    # Create graphs
+    graphs = torch.zeros([batch_size, graph_size, graph_size])
+    init_amps = torch.zeros([batch_size, graph_size, graph_size])
+
+    for edgelist in range(0, tmp.shape[0], graph_size):
+        graph_ids = tmp[edgelist:edgelist+graph_size]
+        new_graph = torch.zeros((graph_size, graph_size))
+        for i in range(len(graph_ids)):
+            new_graph[i, :] = torch.from_numpy((np.isin(graph_ids.data, adj[graph_ids[i]].data)).astype(int))
+        graphs[edgelist/graph_size] = new_graph
+
+    # Calculate max degree in each graph
+    nodes=[graph_size]*batch_size
+    degree = 0
+    for g in graphs:
+        d = np.int(np.max(np.sum(g.numpy(), 1)))
+        if d > degree:
+            degree = d
+    degrees=[degree]*batch_size
+
+    # Calculate amplitudes
+    all_amps=[]
+    for i in range(len(graphs)):
+        amps=np.zeros((len(graphs[i]),degrees[i],len(graphs[i])))
+        for j in range(len(amps)): #Put initial amps only on atom locations
+            jdegree=np.int(np.sum(graphs[i][j].numpy()))
+            if jdegree==0:
+                continue
+            amps[j, :jdegree, j] = 1. / np.sqrt(jdegree)
+        all_amps.append(np.array(amps))
+    all_amps = nn.Parameter(torch.FloatTensor(all_amps))
+
+    if tmp.is_cuda:
+            all_amps = all_amps.cuda()
+            #swap = swap.cuda()
+
+    return all_amps, graphs, degree
+
+def groverDiffusion(n):
+    g=np.ones((n,n))*2.0/n
+    np.fill_diagonal(g,-1+2./n)
+    return g
